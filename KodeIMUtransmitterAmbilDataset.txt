@@ -1,0 +1,136 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// Setup MPU6050 dari Adafruit
+Adafruit_MPU6050 mpu;
+
+// MAC address ESP32 penerima (EMG)
+uint8_t receiverMAC[] = {0xEC, 0xE3, 0x34, 0xC0, 0x7D, 0x60}; // PASTE MAC EMG RECEIVER DI SINI
+
+// Struct data IMU yang dikirim ke EMG Receiver
+typedef struct struct_message {
+  float ax, ay, az;
+  float gx, gy, gz;
+} struct_message;
+
+// Struct data gabungan yang diterima dari EMG Receiver
+typedef struct combined_message {
+  float ax, ay, az;
+  float gx, gy, gz;
+  float emg_mav;
+  float emg_rms;
+} combined_message; 
+
+struct_message dataMPU;
+combined_message receivedCombined;
+
+// --- Variabel untuk Mengontrol Interval Pencetakan Serial ---
+unsigned long lastPrintTime = 0;
+const long PRINT_INTERVAL_MS = 100; // <<< ATUR INI: 100ms atau 200ms >>>
+
+// Debug callback untuk status pengiriman data IMU ke EMG
+void onSend(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  // if (status == ESP_NOW_SEND_SUCCESS) {
+  //   Serial.println("IMU: Data IMU berhasil dikirim ke EMG.");
+  // } else {
+  //   Serial.println("IMU: GAGAL mengirim data IMU ke EMG.");
+  // }
+}
+
+// Callback untuk menerima data gabungan dari EMG Receiver
+void onReceive(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  if (len == sizeof(combined_message)) {
+      memcpy(&receivedCombined, incomingData, sizeof(receivedCombined));
+      
+      // --- Logika Kontrol Interval Pencetakan ---
+      unsigned long currentTime = millis();
+      if (currentTime - lastPrintTime >= PRINT_INTERVAL_MS) {
+        lastPrintTime = currentTime; // Update waktu cetak terakhir
+        
+        // Cetak 8 fitur ke Serial Monitor
+        Serial.print(receivedCombined.ax); Serial.print(",");
+        Serial.print(receivedCombined.ay); Serial.print(",");
+        Serial.print(receivedCombined.az); Serial.print(",");
+        Serial.print(receivedCombined.gx); Serial.print(",");
+        Serial.print(receivedCombined.gy); Serial.print(",");
+        Serial.print(receivedCombined.gz); Serial.print(",");
+        Serial.print(receivedCombined.emg_mav); Serial.print(",");
+        Serial.print(receivedCombined.emg_rms);
+        Serial.print("\r\n"); // Tambahkan baris baru secara eksplisit
+      }
+  } else {
+    // Debug: Menerima data dengan ukuran yang tidak diharapkan
+    // Serial.print("IMU: Menerima data dari EMG dengan ukuran tidak sesuai: ");
+    // Serial.println(len);
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(100); // Beri waktu Serial Monitor siap
+  Serial.println("\n--- IMU Transmitter Setup Dimulai ---");
+
+  WiFi.mode(WIFI_STA);
+  Serial.print("IMU MAC Address Lokal: ");
+  Serial.println(WiFi.macAddress()); // Tampilkan MAC Address ESP IMU
+
+  Wire.begin(); // Inisialisasi I2C untuk MPU6050
+
+  // Inisialisasi MPU6050
+  if (!mpu.begin()) {
+    Serial.println("IMU: MPU6050 tidak ditemukan!");
+    // while (1) delay(10); // Hapus atau jadikan komentar agar tidak stuck jika MPU tidak ada
+    Serial.println("IMU: Melanjutkan tanpa MPU6050."); // Agar program tidak stuck
+  } else {
+    Serial.println("IMU: MPU6050 berhasil diinisialisasi.");
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
+  // Inisialisasi ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("IMU: ESP-NOW Init GAGAL!");
+    return;
+  }
+  Serial.println("IMU: ESP-NOW Init BERHASIL.");
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMAC, 6);
+  peerInfo.channel = 0; // Menggunakan channel WiFi saat ini (default)
+  // Atau, set channel secara eksplisit jika ada masalah komunikasi
+  // peerInfo.channel = 1; // Coba set ke channel yang sama di kedua ESP
+  peerInfo.encrypt = false;
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("IMU: GAGAL menambahkan peer (EMG Receiver)!");
+    return;
+  }
+  Serial.println("IMU: Peer (EMG Receiver) BERHASIL ditambahkan.");
+
+  esp_now_register_send_cb(onSend);
+  esp_now_register_recv_cb(onReceive);
+  Serial.println("IMU: Callback onSend dan onReceive terdaftar.");
+  Serial.println("--- IMU Transmitter Setup Selesai ---");
+}
+
+void loop() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  dataMPU.ax = a.acceleration.x;
+  dataMPU.ay = a.acceleration.y;
+  dataMPU.az = a.acceleration.z;
+  dataMPU.gx = g.gyro.x;
+  dataMPU.gy = g.gyro.y;
+  dataMPU.gz = g.gyro.z;
+
+  // Kirim data IMU ke ESP EMG
+  esp_now_send(receiverMAC, (uint8_t *)&dataMPU, sizeof(dataMPU));
+
+  delay(10);
+}

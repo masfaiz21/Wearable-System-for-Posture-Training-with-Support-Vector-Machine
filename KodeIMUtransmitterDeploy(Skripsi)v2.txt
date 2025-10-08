@@ -1,0 +1,272 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// Setup MPU6050 dari Adafruit
+Adafruit_MPU6050 mpu;
+
+// MAC address ESP32 penerima (EMG)
+uint8_t receiverMAC[] = {0xEC, 0xE3, 0x34, 0xC0, 0x7D, 0x60}; // Ganti dengan MAC address EMG Receiver Anda
+
+// PASTE MAC EMG RECEIVER DI SINI
+
+// MODIFIKASI: PIN UNTUK TOMBOL TRIGGER DI IMU
+#define TRIGGER_BUTTON_PIN 0 // PIN UNTUK TOMBOL TRIGGER (GPIO0)
+
+// --- Variabel untuk Debounce Tombol ---
+unsigned long lastButtonPressTime = 0;
+const long DEBOUNCE_DELAY = 50; // Milliseconds
+
+// Struct data IMU yang dikirim ke EMG Receiver (tidak berubah)
+typedef struct struct_imu_message {
+  float ax, ay, az;
+  float gx, gy, gz;
+} struct_imu_message;
+struct_imu_message dataMPU;
+
+// MODIFIKASI: Tipe Pesan ESP-NOW (HARUS SAMA PERSIS DENGAN EMG)
+enum MessageType {
+  MSG_TYPE_STATE_UPDATE,
+  MSG_TYPE_FRAME_DATA,
+  MSG_TYPE_COLLECTION_TIME,
+  MSG_TYPE_FEATURES,
+  MSG_TYPE_PREDICTION_RESULT,
+  MSG_TYPE_DEBUG,
+  MSG_TYPE_BUTTON_TRIGGER // Tipe pesan baru untuk pemicu tombol dari IMU
+};
+
+// MODIFIKASI: Struct Universal untuk Mengirim Berbagai Jenis Data dari IMU ke EMG
+// HARUS SAMA PERSIS DENGAN imu_to_emg_message PADA KODE EMG!
+typedef struct {
+  MessageType type; // Tipe pesan
+  int current_imu_state; // Status IMU saat pesan ini dikirim (untuk informasi saja)
+
+  union {
+    struct {
+      float ax, ay, az;
+      float gx, gy, gz;
+      float emg_mav, emg_rms;
+    } frame_data;
+
+    unsigned long collection_compute_time;
+
+    float extracted_features[32];
+
+    struct {
+      int prediction_label;
+      unsigned long prediction_compute_time;
+    } prediction_result;
+
+    bool button_pressed; // Tambahan untuk status tombol dari IMU
+
+    char debug_message[64];
+  };
+
+} imu_to_emg_message; // Ganti nama struct untuk kejelasan arah komunikasi
+
+imu_to_emg_message messageToSendToEMG; // Variabel untuk mengirim data ke EMG
+
+// MODIFIKASI: Struct untuk menerima feedback dari EMG ke IMU
+// HARUS SAMA PERSIS DENGAN emg_to_imu_feedback_message PADA KODE EMG!
+typedef struct {
+  MessageType type;
+  int current_emg_state; // State EMG saat ini
+
+  union {
+    int prediction_label; // Untuk MSG_TYPE_PREDICTION_RESULT
+
+    // Pastikan field-field ini sama persis dengan yang didefinisikan di EMG untuk feedback
+    struct {
+      float ax, ay, az;
+      float gx, gy, gz;
+      float emg_mav, emg_rms;
+    } frame_data;
+
+    unsigned long collection_compute_time;
+
+    float extracted_features[32];
+
+    struct {
+      int prediction_label; // Nama field harus sama dengan yang di EMG feedback
+      unsigned long prediction_compute_time; // Nama field harus sama dengan yang di EMG feedback
+    } prediction_result;
+
+    char debug_message[64]; // Nama field harus sama dengan yang di EMG feedback
+  };
+} emg_to_imu_feedback_message;
+
+emg_to_imu_feedback_message receivedEMGMessage; // Variabel untuk menerima feedback EMG
+
+// Debug callback untuk status pengiriman data IMU ke EMG
+void onSend(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  // Ini dipanggil saat IMU mengirim data ke EMG
+  // Anda bisa menambahkan debug di sini jika diperlukan
+}
+
+// Callback untuk menerima hasil klasifikasi dan status dari EMG Receiver
+// MODIFIKASI: Menggunakan receivedEMGMessage (struct feedback baru)
+void onReceive(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  // Pastikan ukuran data yang diterima cocok
+  if (len == sizeof(emg_to_imu_feedback_message)) {
+      memcpy(&receivedEMGMessage, incomingData, sizeof(receivedEMGMessage));
+
+      // Berdasarkan tipe pesan, cetak output yang sesuai
+      switch (receivedEMGMessage.type) {
+        case MSG_TYPE_STATE_UPDATE:
+            switch (receivedEMGMessage.current_emg_state) {
+                // Mapping SystemState (dari EMG) ke pesan di IMU
+                case 0: // STANDBY_MODE
+                    Serial.println("--- Kembali ke Mode Standby. Tekan Tombol untuk Mulai Lagi ---");
+                    break;
+                case 1: // COUNTDOWN_MODE
+                    // Pesan ini hanya indikasi bahwa EMG sudah di COUNTDOWN_MODE
+                    // "Tombol Ditekan" sudah dicetak oleh IMU saat mengirim trigger
+                    // Serial.println("\n--- Tombol Ditekan! Memulai Hitung Mundur ---"); // Jangan double print
+                    Serial.println("..."); // Tetap cetak titik hitung mundur
+                    break;
+                case 2: // COLLECTING_DATA_MODE
+                    Serial.println("\n--- Mulai Pengambilan Data! ---");
+                    break;
+                case 3: // PREDICTING_MODE
+                    Serial.println("\n--- Pengambilan Data Selesai. Memulai Prediksi ---");
+                    break;
+                case 4: // FEEDBACK_MODE
+                    // Ini adalah transisi setelah prediksi selesai, biasanya tidak ada print khusus di sini
+                    break;
+            }
+            break;
+
+        case MSG_TYPE_FRAME_DATA: // Data frame dari EMG ke IMU (untuk visualisasi/debugging)
+            // PERBAIKAN: Akses field melalui .frame_data.
+            Serial.print(receivedEMGMessage.frame_data.ax, 2); Serial.print(",");
+            Serial.print(receivedEMGMessage.frame_data.ay, 2); Serial.print(",");
+            Serial.print(receivedEMGMessage.frame_data.az, 2); Serial.print(",");
+            Serial.print(receivedEMGMessage.frame_data.gx, 2); Serial.print(",");
+            Serial.print(receivedEMGMessage.frame_data.gy, 2); Serial.print(",");
+            Serial.print(receivedEMGMessage.frame_data.gz, 2); Serial.print(",");
+            Serial.print(receivedEMGMessage.frame_data.emg_mav, 2); Serial.print(","); // PERBAIKAN DI SINI
+            Serial.println(receivedEMGMessage.frame_data.emg_rms, 2); // PERBAIKAN DI SINI
+            break;
+
+        case MSG_TYPE_COLLECTION_TIME:
+            Serial.print("Waktu Komputasi Pengambilan Data: ");
+            Serial.print(receivedEMGMessage.collection_compute_time);
+            Serial.println(" ms");
+            break;
+
+        case MSG_TYPE_FEATURES:
+            Serial.print("Fitur Preprocessed: ");
+            for(int i=0; i<32; i++) {
+                Serial.print(receivedEMGMessage.extracted_features[i], 6);
+                if (i < 31) Serial.print(",");
+            }
+            Serial.println();
+            break;
+
+        case MSG_TYPE_PREDICTION_RESULT:
+            Serial.print("KLASIFIKASI: ");
+            // PERBAIKAN: Akses field melalui .prediction_result.
+            if (receivedEMGMessage.prediction_result.prediction_label == 1) {
+                Serial.println("BENAR!");
+            } else {
+                Serial.println("SALAH!");
+            }
+            Serial.println("Hasil klasifikasi dikirim ke IMU.");
+            Serial.print("Waktu Komputasi Prediksi: ");
+            Serial.print(receivedEMGMessage.prediction_result.prediction_compute_time); // PERBAIKAN DI SINI
+            Serial.println(" us");
+            break;
+
+        case MSG_TYPE_DEBUG:
+            Serial.print("[DEBUG EMG]: ");
+            Serial.println(receivedEMGMessage.debug_message); // PERBAIKAN DI SINI
+            break;
+        default:
+            Serial.println("IMU: Menerima pesan EMG dengan tipe tidak dikenal.");
+            break;
+      }
+  } else {
+    Serial.print("IMU: Ukuran pesan tidak cocok dari EMG. Diharapkan: ");
+    Serial.print(sizeof(emg_to_imu_feedback_message));
+    Serial.print(", Diterima: ");
+    Serial.println(len);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n--- IMU Transmitter Deployment Setup Dimulai ---");
+
+  WiFi.mode(WIFI_STA);
+  Serial.print("IMU MAC Address Lokal: ");
+  Serial.println(WiFi.macAddress());
+
+  Wire.begin();
+  if (!mpu.begin()) {
+    Serial.println("IMU: MPU6050 tidak ditemukan!");
+    Serial.println("IMU: Melanjutkan tanpa MPU6050.");
+  } else {
+    Serial.println("IMU: MPU6050 berhasil diinisialisasi.");
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
+  // MODIFIKASI: Inisialisasi pin tombol
+  pinMode(TRIGGER_BUTTON_PIN, INPUT_PULLUP);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("IMU: ESP-NOW Init GAGAL!");
+    return;
+  }
+  Serial.println("IMU: ESP-NOW Init BERHASIL.");
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMAC, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("IMU: GAGAL menambahkan peer (EMG Receiver)!");
+    return;
+  }
+  Serial.println("IMU: Peer (EMG Receiver) BERHASIL ditambahkan.");
+
+  esp_now_register_send_cb(onSend);
+  esp_now_register_recv_cb(onReceive);
+  Serial.println("IMU: Callback onSend dan onReceive terdaftar.");
+  Serial.println("--- IMU Transmitter Deployment Setup Selesai ---");
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+
+  // Baca status tombol
+  int buttonState = digitalRead(TRIGGER_BUTTON_PIN);
+
+  // MODIFIKASI: Kirim trigger tombol ke EMG hanya saat ditekan dan debounce
+  if (buttonState == LOW && (currentTime - lastButtonPressTime) > DEBOUNCE_DELAY) {
+    Serial.println("IMU: Tombol ditekan! Mengirim trigger ke EMG.");
+    messageToSendToEMG.type = MSG_TYPE_BUTTON_TRIGGER; // Set tipe pesan
+    messageToSendToEMG.current_imu_state = 0; // Tidak ada state spesifik dari IMU untuk ini, bisa 0 atau nilai default
+    messageToSendToEMG.button_pressed = true; // Set payload tombol ditekan (UBAH AKSES LANGSUNG)
+    esp_now_send(receiverMAC, (uint8_t *)&messageToSendToEMG, sizeof(messageToSendToEMG));
+    lastButtonPressTime = currentTime; // Perbarui waktu tekan tombol terakhir
+    delay(100); // Sedikit delay setelah mengirim trigger agar tidak spam
+  }
+
+  // Kirim data IMU reguler
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  dataMPU.ax = a.acceleration.x;
+  dataMPU.ay = a.acceleration.y;
+  dataMPU.az = a.acceleration.z;
+  dataMPU.gx = g.gyro.x;
+  dataMPU.gy = g.gyro.y;
+  dataMPU.gz = g.gyro.z;
+  esp_now_send(receiverMAC, (uint8_t *)&dataMPU, sizeof(dataMPU));
+
+  delay(10); // Kirim data IMU setiap 10ms
+}

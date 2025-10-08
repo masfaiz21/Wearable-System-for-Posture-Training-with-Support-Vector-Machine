@@ -1,0 +1,138 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <cmath> // Diperlukan untuk fungsi abs() dan sqrt()
+
+// --- Definisi Pin dan Parameter EMG ---
+#define EMG_PIN 34
+#define SAMPLE_SIZE 100 // Jumlah sampel EMG untuk perhitungan MAV/RMS
+#define HPF_ALPHA 0.995 // Alpha untuk High Pass Filter EMG
+
+// --- Variabel Global dan Buffer EMG ---
+float emgFiltered[SAMPLE_SIZE];
+int bufIndex = 0;
+float prevInput = 0, prevOutput = 0;
+
+// --- Definisi Struct untuk Komunikasi ESP-NOW ---
+typedef struct struct_imu_message {
+  float ax, ay, az;
+  float gx, gy, gz;
+} struct_imu_message;
+
+typedef struct {
+  float ax, ay, az;
+  float gx, gy, gz;
+  float emg_mav;
+  float emg_rms;
+} combined_8_features_message;
+
+// --- Variabel untuk Data Sensor ---
+struct_imu_message receivedIMUData;
+combined_8_features_message dataToSendToIMU;
+
+// MAC Address ESP32 IMU Transmitter (peer yang akan kita kirim data gabungan)
+uint8_t imuTransmitterMAC[] = {0x5C, 0x01, 0x3B, 0x47, 0x10, 0xB0}; // PASTE MAC IMU TRANSMITTER DI SINI
+
+// --- Fungsi Perhitungan EMG ---
+float calculateMAV() {
+  float sum = 0;
+  for (int i = 0; i < SAMPLE_SIZE; i++) {
+    sum += emgFiltered[i];
+  }
+  return sum / SAMPLE_SIZE;
+}
+
+float calculateRMS() {
+  float sumSq = 0;
+  for (int i = 0; i < SAMPLE_SIZE; i++) {
+    sumSq += emgFiltered[i] * emgFiltered[i];
+  }
+  return sqrt(sumSq / SAMPLE_SIZE);
+}
+
+// --- Callback ESP-NOW untuk Menerima Data IMU ---
+void onReceiveIMU(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  if (len == sizeof(struct_imu_message)) {
+    memcpy(&receivedIMUData, incomingData, sizeof(receivedIMUData));
+    // Debug: Konfirmasi penerimaan IMU
+    // Serial.println("EMG: Menerima data IMU.");
+  } else {
+    // Debug: Menerima data dengan ukuran yang tidak diharapkan
+    // Serial.print("EMG: Menerima data IMU dengan ukuran tidak sesuai: ");
+    // Serial.println(len);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100); // Beri waktu Serial Monitor siap
+  Serial.println("\n--- EMG Receiver Setup Dimulai ---");
+
+  WiFi.mode(WIFI_STA);
+  Serial.print("EMG MAC Address Lokal: ");
+  Serial.println(WiFi.macAddress()); // Tampilkan MAC Address ESP EMG
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("EMG: ESP-NOW Init GAGAL!");
+    return;
+  }
+  Serial.println("EMG: ESP-NOW Init BERHASIL.");
+
+  esp_now_register_recv_cb(onReceiveIMU);
+  Serial.println("EMG: Callback onReceive IMU terdaftar.");
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, imuTransmitterMAC, 6);
+  peerInfo.channel = 0; // Menggunakan channel WiFi saat ini (default)
+  // Atau, set channel secara eksplisit jika ada masalah komunikasi
+  // peerInfo.channel = 1; // Coba set ke channel yang sama di kedua ESP
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("EMG: GAGAL menambahkan peer (IMU Transmitter)!");
+    return;
+  }
+  Serial.println("EMG: Peer (IMU Transmitter) BERHASIL ditambahkan.");
+  Serial.println("--- EMG Receiver Setup Selesai ---");
+}
+
+void loop() {
+  float input = analogRead(EMG_PIN);
+  float filtered = HPF_ALPHA * (prevOutput + input - prevInput);
+  prevInput = input;
+  prevOutput = filtered;
+
+  emgFiltered[bufIndex] = abs(filtered);
+  bufIndex++;
+
+  float currentMAV = 0;
+  float currentRMS = 0;
+
+  if (bufIndex >= SAMPLE_SIZE) {
+    currentMAV = calculateMAV();
+    currentRMS = calculateRMS();
+    bufIndex = 0;
+  } else {
+    currentMAV = dataToSendToIMU.emg_mav;
+    currentRMS = dataToSendToIMU.emg_rms;
+  }
+
+  dataToSendToIMU.ax = receivedIMUData.ax;
+  dataToSendToIMU.ay = receivedIMUData.ay;
+  dataToSendToIMU.az = receivedIMUData.az;
+  dataToSendToIMU.gx = receivedIMUData.gx;
+  dataToSendToIMU.gy = receivedIMUData.gy;
+  dataToSendToIMU.gz = receivedIMUData.gz;
+  dataToSendToIMU.emg_mav = currentMAV;
+  dataToSendToIMU.emg_rms = currentRMS;
+
+  // Debug: Konfirmasi pengiriman dari EMG ke IMU
+  esp_err_t result = esp_now_send(imuTransmitterMAC, (uint8_t*)&dataToSendToIMU, sizeof(combined_8_features_message));
+  // if (result == ESP_OK) {
+  //   Serial.println("EMG: Data gabungan berhasil dikirim ke IMU.");
+  // } else {
+  //   Serial.print("EMG: GAGAL mengirim data gabungan ke IMU. Kode: ");
+  //   Serial.println(result);
+  // }
+
+  delay(1);
+}

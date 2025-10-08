@@ -1,0 +1,507 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <cmath>
+#include "svm_model_params.h"
+
+// --- Definisi Pin dan Parameter Sensor ---
+#define EMG_PIN 34
+#define BUZZER_PIN 2 // Pin untuk buzzer
+// #define TRIGGER_BUTTON_PIN 0 // PIN UNTUK TOMBOL TRIGGER (GPIO0) - Dihapus dari EMG
+
+#define SAMPLE_SIZE 100
+#define HPF_ALPHA 0.995
+
+// --- Definisi Parameter Repetisi ---
+#define FIXED_FRAMES_PER_PREPETITION 50
+#define FRAME_COLLECTION_INTERVAL_MS 100
+
+// --- Definisi State Sistem ---
+enum SystemState {
+  STANDBY_MODE,
+  COUNTDOWN_MODE,
+  COLLECTING_DATA_MODE,
+  PREDICTING_MODE,
+  FEEDBACK_MODE
+};
+SystemState currentState = STANDBY_MODE;
+
+// --- Tipe Pesan ESP-NOW ---
+enum MessageType {
+  MSG_TYPE_STATE_UPDATE,
+  MSG_TYPE_FRAME_DATA,
+  MSG_TYPE_COLLECTION_TIME,
+  MSG_TYPE_FEATURES,
+  MSG_TYPE_PREDICTION_RESULT,
+  MSG_TYPE_DEBUG,
+  MSG_TYPE_BUTTON_TRIGGER // Tipe pesan baru untuk pemicu tombol dari IMU
+};
+
+// --- Variabel Global dan Buffer EMG ---
+float emgFiltered[SAMPLE_SIZE];
+int bufIndex = 0;
+float prevInput = 0, prevOutput = 0;
+
+// --- Buffer untuk Menyimpan Data Mentah 1 Repetisi ---
+float ax_buffer[FIXED_FRAMES_PER_PREPETITION];
+float ay_buffer[FIXED_FRAMES_PER_PREPETITION];
+float az_buffer[FIXED_FRAMES_PER_PREPETITION];
+float gx_buffer[FIXED_FRAMES_PER_PREPETITION];
+float gy_buffer[FIXED_FRAMES_PER_PREPETITION];
+float gz_buffer[FIXED_FRAMES_PER_PREPETITION];
+float emg_mav_buffer[FIXED_FRAMES_PER_PREPETITION];
+float emg_rms_buffer[FIXED_FRAMES_PER_PREPETITION];
+int current_frame_count = 0;
+
+// --- Variabel untuk menyimpan MAV/RMS terakhir yang dihitung ---
+float lastCalculatedMAV = 0.0;
+float lastCalculatedRMS = 0.0;
+
+// --- Variabel untuk Kontrol Waktu ---
+unsigned long countdownStartTime = 0;
+unsigned long lastBeepTime = 0;
+int beepCount = 0;
+const long BEEP_INTERVAL_MS = 300;
+const long SINGLE_BEEP_DURATION_MS = 50;
+unsigned long lastFrameCollectionTime = 0;
+
+// --- Variabel untuk Mengukur Waktu Komputasi ---
+unsigned long collectModeStartTime = 0;
+unsigned long predictionStartTime = 0;
+
+// --- Definisi Struct untuk Komunikasi ESP-NOW ---
+typedef struct struct_imu_message {
+  float ax, ay, az;
+  float gx, gy, gz;
+} struct_imu_message;
+
+// MODIFIKASI: Struct Universal untuk Menerima Berbagai Jenis Data dari IMU ke EMG
+// HARUS SAMA PERSIS DENGAN imu_to_emg_message PADA KODE IMU!
+typedef struct {
+  MessageType type; // Tipe pesan
+  int current_imu_state; // Status IMU saat pesan ini dikirim (bukan EMG state lagi)
+
+  union {
+    struct {
+      float ax, ay, az;
+      float gx, gy, gz;
+      float emg_mav, emg_rms;
+    } frame_data;
+
+    unsigned long collection_compute_time;
+
+    float extracted_features[32];
+
+    struct {
+      int prediction_label;
+      unsigned long prediction_compute_time;
+    } prediction_result;
+
+    bool button_pressed; // Tambahan untuk status tombol dari IMU
+
+    char debug_message[64];
+  };
+
+} imu_to_emg_message; // Ganti nama struct untuk kejelasan arah komunikasi
+
+// Variabel untuk data yang akan dikirim dari EMG ke IMU
+// MODIFIKASI: Gunakan nama yang lebih jelas
+typedef struct {
+  MessageType type;
+  int current_emg_state;
+
+  union {
+    // Tambahkan field-field yang benar-benar akan dikirim dari EMG ke IMU
+    // Berdasarkan kode IMU yang diperbaiki, IMU menerima:
+    // - prediction_label, prediction_compute_time (di dalam struct prediction_result)
+    // - frame_data (jika EMG mengirim frame data balik)
+    // - collection_compute_time (jika EMG mengirim waktu komputasi balik)
+    // - extracted_features (jika EMG mengirim fitur balik)
+    // - debug_message (jika EMG mengirim debug balik)
+
+    // Penting: Pastikan field-field di union ini sama persis dengan yang di onReceive IMU
+    // yang digunakan untuk menerima `emg_to_imu_feedback_message`.
+
+    struct { // Ini adalah bagian untuk MSG_TYPE_PREDICTION_RESULT
+      int prediction_label;
+      unsigned long prediction_compute_time;
+    } prediction_result;
+
+    struct { // Ini adalah bagian untuk MSG_TYPE_FRAME_DATA (jika EMG mengirimnya balik)
+      float ax, ay, az;
+      float gx, gy, gz;
+      float emg_mav, emg_rms;
+    } frame_data;
+
+    unsigned long collection_compute_time; // Untuk MSG_TYPE_COLLECTION_TIME
+
+    float extracted_features[32]; // Untuk MSG_TYPE_FEATURES
+
+    char debug_message[64]; // Untuk MSG_TYPE_DEBUG
+  };
+} emg_to_imu_feedback_message; // Struct ini khusus untuk feedback dari EMG ke IMU
+
+emg_to_imu_feedback_message feedbackToSend; // Variabel untuk feedback EMG ke IMU
+
+// Variabel untuk data yang diterima dari IMU
+struct_imu_message receivedIMUData;
+
+// MAC Address ESP32 IMU Transmitter
+uint8_t imuTransmitterMAC[] = {0x5C, 0x01, 0x3B, 0x47, 0x10, 0xB0}; // PASTE MAC IMU TRANSMITTER DI SINI
+
+// Fungsi Perhitungan EMG (Sama seperti sebelumnya)
+float calculateMAV() {
+  float sum = 0;
+  for (int i = 0; i < SAMPLE_SIZE; i++) {
+    sum += emgFiltered[i];
+  }
+  return sum / SAMPLE_SIZE;
+}
+
+float calculateRMS() {
+  float sumSq = 0;
+  for (int i = 0; i < SAMPLE_SIZE; i++) {
+    sumSq += emgFiltered[i] * emgFiltered[i];
+  }
+  return sqrt(sumSq / SAMPLE_SIZE);
+}
+
+// Fungsi Ekstraksi 32 Fitur (Sama seperti sebelumnya)
+void extractFeatures(float features_raw_ax[], float features_raw_ay[], float features_raw_az[],
+                     float features_raw_gx[], float features_raw_gy[], float features_raw_gz[],
+                     float features_raw_mav[], float features_raw_rms[],
+                     float extractedFeatures[32]) {
+    float* raw_data_arrays[8] = {
+        features_raw_ax, features_raw_ay, features_raw_az,
+        features_raw_gx, features_raw_gy, features_raw_gz,
+        features_raw_mav, features_raw_rms
+    };
+    int feature_idx = 0;
+    for (int i = 0; i < 8; i++) {
+        float sum = 0;
+        float min_val = (FIXED_FRAMES_PER_PREPETITION > 0) ? raw_data_arrays[i][0] : 0.0;
+        float max_val = (FIXED_FRAMES_PER_PREPETITION > 0) ? raw_data_arrays[i][0] : 0.0;
+
+        for (int j = 0; j < FIXED_FRAMES_PER_PREPETITION; j++) {
+            sum += raw_data_arrays[i][j];
+            if (raw_data_arrays[i][j] < min_val) min_val = raw_data_arrays[i][j];
+            if (raw_data_arrays[i][j] > max_val) max_val = raw_data_arrays[i][j];
+        }
+        float mean_val = sum / FIXED_FRAMES_PER_PREPETITION;
+
+        float sum_sq_diff = 0;
+        for (int j = 0; j < FIXED_FRAMES_PER_PREPETITION; j++) {
+            sum_sq_diff += pow(raw_data_arrays[i][j] - mean_val, 2);
+        }
+        float std_val = (FIXED_FRAMES_PER_PREPETITION > 1) ? sqrt(sum_sq_diff / (FIXED_FRAMES_PER_PREPETITION - 1)) : 0.0;
+
+        extractedFeatures[feature_idx++] = mean_val;
+        extractedFeatures[feature_idx++] = std_val;
+        extractedFeatures[feature_idx++] = min_val;
+        extractedFeatures[feature_idx++] = max_val;
+    }
+}
+
+// Fungsi Normalisasi Min-Max 32 Fitur (Sama seperti sebelumnya)
+void normalizeMinMax(float features[32]) {
+    for (int i = 0; i < 32; i++) {
+        float min_val = GLOBAL_MIN_MAX_FEATURES_MIN[i];
+        float max_val = GLOBAL_MIN_MAX_FEATURES_MAX[i];
+
+        float data_range = max_val - min_val;
+
+        if (data_range == 0) {
+            features[i] = 0.0;
+        } else {
+            features[i] = (features[i] - min_val) / data_range;
+        }
+    }
+}
+
+// Fungsi Prediksi SVM (Sama seperti sebelumnya)
+int predictSVM(float features[32]) {
+    float scaledFeatures[32];
+    for (int i = 0; i < 32; i++) {
+        if (SCALER_STDS[i] == 0) {
+            scaledFeatures[i] = 0;
+        } else {
+            scaledFeatures[i] = (features[i] - SCALER_MEANS[i]) / SCALER_STDS[i];
+        }
+    }
+
+    float decision_value = SVM_BIAS;
+    for (int i = 0; i < NUM_SUPPORT_VECTORS; i++) {
+        float sum_diff_sq = 0.0;
+        for (int j = 0; j < 32; j++) {
+            float diff = scaledFeatures[j] - SUPPORT_VECTORS[i][j];
+            sum_diff_sq += diff * diff;
+        }
+        float kernel_output = exp(-SVM_GAMMA * sum_diff_sq);
+        decision_value += DUAL_COEFS[i] * kernel_output;
+    }
+
+    return (decision_value > 0) ? 1 : 0;
+}
+
+// Callback ESP-NOW untuk Menerima Berbagai Jenis Data dari IMU Transmitter
+// MODIFIKASI: Menggunakan imu_to_emg_message yang baru
+void onReceiveIMU(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  // Ini akan menerima pesan IMU data mentah DAN pesan pemicu tombol
+  if (len == sizeof(struct_imu_message)) { // Jika ini adalah data IMU reguler
+    memcpy(&receivedIMUData, incomingData, sizeof(receivedIMUData));
+  }
+  // MODIFIKASI: Tambahkan penanganan untuk pesan pemicu tombol dari IMU
+  else if (len == sizeof(imu_to_emg_message)) {
+    imu_to_emg_message receivedGeneralMessage;
+    memcpy(&receivedGeneralMessage, incomingData, sizeof(receivedGeneralMessage));
+
+    if (receivedGeneralMessage.type == MSG_TYPE_BUTTON_TRIGGER) {
+      if (receivedGeneralMessage.button_pressed) {
+        // Hanya ubah state jika EMG dalam STANDBY_MODE
+        if (currentState == STANDBY_MODE) {
+          Serial.println("\n--- Tombol Ditekan dari IMU! Memulai Hitung Mundur ---");
+          currentState = COUNTDOWN_MODE;
+          countdownStartTime = millis(); // Gunakan millis() untuk waktu sekarang
+          lastBeepTime = millis();
+          beepCount = 0;
+          digitalWrite(BUZZER_PIN, LOW); // Pastikan buzzer mati sebelum hitung mundur
+        }
+      }
+    }
+  } else {
+    // Opsional: cetak pesan debug jika ada ketidakcocokan ukuran
+    // Serial.print("EMG: Ukuran pesan tidak cocok dari IMU. Diharapkan IMU: ");
+    // Serial.print(sizeof(struct_imu_message));
+    // Serial.print(" atau Umum: ");
+    // Serial.print(sizeof(imu_to_emg_message));
+    // Serial.print(", Diterima: ");
+    // Serial.println(len);
+  }
+}
+
+// Callback untuk status pengiriman feedback dari EMG ke IMU
+void onSend(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  // Ini dipanggil saat EMG mengirim feedback ke IMU
+  // Anda bisa menambahkan debug di sini jika diperlukan
+}
+
+// Fungsi untuk mengirim feedback dari EMG ke IMU
+// MODIFIKASI: Menggunakan feedbackToSend
+void sendFeedbackToIMU() {
+    esp_now_send(imuTransmitterMAC, (uint8_t*)&feedbackToSend, sizeof(feedbackToSend));
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n--- EMG Receiver Deployment Setup Dimulai ---");
+
+  WiFi.mode(WIFI_STA);
+  Serial.print("EMG MAC Address Lokal: ");
+  Serial.println(WiFi.macAddress());
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("EMG: ESP-NOW Init GAGAL!");
+    return;
+  }
+  Serial.println("EMG: ESP-NOW Init BERHASIL.");
+
+  // MODIFIKASI: Register onReceiveIMU untuk menerima data IMU dan juga trigger
+  esp_now_register_recv_cb(onReceiveIMU);
+  Serial.println("EMG: Callback onReceive IMU terdaftar.");
+
+  // MODIFIKASI: Tambahkan peer untuk mengirim feedback ke IMU
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, imuTransmitterMAC, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("EMG: GAGAL menambahkan peer (IMU Transmitter)!");
+    return;
+  }
+  Serial.println("EMG: Peer (IMU Transmitter) BERHASIL ditambahkan.");
+
+  // MODIFIKASI: Register onSend untuk feedback ke IMU
+  esp_now_register_send_cb(onSend); // Ini untuk status pengiriman feedback dari EMG ke IMU
+  Serial.println("EMG: Callback onSend (untuk feedback ke IMU) terdaftar.");
+
+  Serial.println("--- EMG Receiver Deployment Setup Selesai ---");
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  // pinMode(TRIGGER_BUTTON_PIN, INPUT_PULLUP); // Dihapus dari EMG
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+
+  float input = analogRead(EMG_PIN);
+  float filtered = HPF_ALPHA * (prevOutput + input - prevInput);
+  prevInput = input;
+  prevOutput = filtered;
+  emgFiltered[bufIndex] = abs(filtered);
+  bufIndex++;
+
+  float currentMAV = 0;
+  float currentRMS = 0;
+  if (bufIndex >= SAMPLE_SIZE) {
+    currentMAV = calculateMAV();
+    currentRMS = calculateRMS();
+    bufIndex = 0;
+    lastCalculatedMAV = currentMAV;
+    lastCalculatedRMS = currentRMS;
+  } else {
+    currentMAV = lastCalculatedMAV;
+    currentRMS = lastCalculatedRMS;
+  }
+
+  switch (currentState) {
+    case STANDBY_MODE:
+      // MODIFIKASI: Logika pemicu tombol dihapus dari sini, akan dipicu oleh onReceiveIMU
+      // Tidak ada yang perlu dilakukan di sini selain menunggu pesan dari IMU
+      break;
+
+    case COUNTDOWN_MODE: {
+      if (beepCount < 3) {
+        if (currentTime - lastBeepTime >= BEEP_INTERVAL_MS) {
+          beepCount++;
+          lastBeepTime = currentTime;
+          if (beepCount == 3) {
+            currentState = COLLECTING_DATA_MODE;
+            current_frame_count = 0;
+            for (int i = 0; i < FIXED_FRAMES_PER_PREPETITION; i++) {
+                ax_buffer[i] = 0; ay_buffer[i] = 0; az_buffer[i] = 0;
+                gx_buffer[i] = 0; gy_buffer[i] = 0; gz_buffer[i] = 0;
+                emg_mav_buffer[i] = 0; emg_rms_buffer[i] = 0;
+            }
+            lastFrameCollectionTime = currentTime;
+            collectModeStartTime = currentTime;
+
+            // Kirim status "Mulai Pengambilan Data" ke IMU
+            feedbackToSend.type = MSG_TYPE_STATE_UPDATE;
+            feedbackToSend.current_emg_state = currentState;
+            sendFeedbackToIMU();
+          }
+        }
+      } else {
+        if (currentState != COLLECTING_DATA_MODE) {
+             currentState = COLLECTING_DATA_MODE;
+             lastFrameCollectionTime = currentTime;
+             collectModeStartTime = currentTime;
+             feedbackToSend.type = MSG_TYPE_STATE_UPDATE;
+             feedbackToSend.current_emg_state = currentState;
+             sendFeedbackToIMU();
+        }
+      }
+      break;
+    }
+
+    case COLLECTING_DATA_MODE: {
+      if (currentTime - lastFrameCollectionTime >= FRAME_COLLECTION_INTERVAL_MS) {
+          lastFrameCollectionTime = currentTime;
+          ax_buffer[current_frame_count] = receivedIMUData.ax;
+          ay_buffer[current_frame_count] = receivedIMUData.ay;
+          az_buffer[current_frame_count] = receivedIMUData.az;
+          gx_buffer[current_frame_count] = receivedIMUData.gx;
+          gy_buffer[current_frame_count] = receivedIMUData.gy;
+          gz_buffer[current_frame_count] = receivedIMUData.gz;
+          emg_mav_buffer[current_frame_count] = currentMAV;
+          emg_rms_buffer[current_frame_count] = currentRMS;
+
+          // Kirim data frame ke IMU (untuk visualisasi debugging di IMU)
+          feedbackToSend.type = MSG_TYPE_FRAME_DATA;
+          feedbackToSend.current_emg_state = currentState; // Sertakan state EMG
+          feedbackToSend.frame_data.ax = ax_buffer[current_frame_count]; // UBAH AKSES LANGSUNG
+          feedbackToSend.frame_data.ay = ay_buffer[current_frame_count]; // UBAH AKSES LANGSUNG
+          feedbackToSend.frame_data.az = az_buffer[current_frame_count]; // UBAH AKSES LANGSUNG
+          feedbackToSend.frame_data.gx = gx_buffer[current_frame_count]; // UBAH AKSES LANGSUNG
+          feedbackToSend.frame_data.gy = gy_buffer[current_frame_count]; // UBAH AKSES LANGSUNG
+          feedbackToSend.frame_data.gz = gz_buffer[current_frame_count]; // UBAH AKSES LANGSUNG
+          feedbackToSend.frame_data.emg_mav = emg_mav_buffer[current_frame_count]; // UBAH AKSES LANGSUNG
+          feedbackToSend.frame_data.emg_rms = emg_rms_buffer[current_frame_count]; // UBAH AKSES LANGSUNG
+          sendFeedbackToIMU();
+
+          current_frame_count++;
+          if (current_frame_count >= FIXED_FRAMES_PER_PREPETITION) {
+            unsigned long collectComputeTime = currentTime - collectModeStartTime;
+
+            currentState = PREDICTING_MODE;
+
+            // Kirim waktu komputasi pengambilan data
+            feedbackToSend.type = MSG_TYPE_COLLECTION_TIME;
+            feedbackToSend.current_emg_state = currentState; // Sertakan state EMG
+            feedbackToSend.collection_compute_time = collectComputeTime; // UBAH AKSES LANGSUNG
+            sendFeedbackToIMU();
+
+            // Kirim status "Mulai Prediksi"
+            feedbackToSend.type = MSG_TYPE_STATE_UPDATE;
+            feedbackToSend.current_emg_state = currentState;
+            sendFeedbackToIMU();
+          }
+      }
+      break;
+    }
+
+    case PREDICTING_MODE: {
+      predictionStartTime = currentTime;
+      float extractedFeatures_raw[32];
+
+      extractFeatures(ax_buffer, ay_buffer, az_buffer, gx_buffer, gy_buffer, gz_buffer,
+                      emg_mav_buffer, emg_rms_buffer, extractedFeatures_raw);
+
+      // Kirim fitur MENTAH hasil ekstraksi ke IMU (untuk debugging/logging)
+      feedbackToSend.type = MSG_TYPE_FEATURES;
+      feedbackToSend.current_emg_state = currentState; // Sertakan state EMG
+      for(int i=0; i<32; i++) {
+        feedbackToSend.extracted_features[i] = extractedFeatures_raw[i]; // UBAH AKSES LANGSUNG
+      }
+      sendFeedbackToIMU();
+
+      float normalizedFeatures[32];
+      memcpy(normalizedFeatures, extractedFeatures_raw, sizeof(extractedFeatures_raw));
+      normalizeMinMax(normalizedFeatures);
+
+      // --- PENGUKURAN WAKTU DIMULAI DI SINI ---
+      unsigned long predictionStartTime = micros(); // Gunakan micros()
+      int prediction = predictSVM(normalizedFeatures);
+      unsigned long predictComputeTime = micros() - predictionStartTime; // Hentikan timer
+      // --- PENGUKURAN WAKTU SELESAI ---
+
+      // Cetak hasil yang lebih detail ke Serial Monitor
+      Serial.print("Waktu Komputasi SVM Murni: ");
+      Serial.print(predictComputeTime);
+      Serial.println(" us"); // 'us' adalah simbol untuk mikrodetik
+
+      digitalWrite(BUZZER_PIN, HIGH);
+      if (prediction == 1) {
+        delay(200);
+      } else {
+        delay(200);
+        digitalWrite(BUZZER_PIN, LOW);
+        delay(200);
+        digitalWrite(BUZZER_PIN, HIGH);
+        delay(200);
+      }
+      digitalWrite(BUZZER_PIN, LOW);
+
+      currentState = FEEDBACK_MODE;
+
+      // Kirim hasil klasifikasi dan waktu komputasi prediksi
+      feedbackToSend.type = MSG_TYPE_PREDICTION_RESULT;
+      feedbackToSend.current_emg_state = currentState; // Sertakan state EMG
+      feedbackToSend.prediction_result.prediction_label = prediction; // UBAH AKSES LANGSUNG
+      feedbackToSend.prediction_result.prediction_compute_time = predictComputeTime; // UBAH AKSES LANGSUNG
+      sendFeedbackToIMU();
+
+      break;
+    }
+
+    case FEEDBACK_MODE:
+      currentState = STANDBY_MODE;
+      feedbackToSend.type = MSG_TYPE_STATE_UPDATE;
+      feedbackToSend.current_emg_state = currentState;
+      sendFeedbackToIMU();
+      break;
+  }
+
+  delay(1);
+}
